@@ -192,3 +192,85 @@ test('CDP installs code once, skips unchanged payloads, updates on navigation, a
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('CDP pushes independent payloads to multiple split panes without moving the sidebar pointer', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-cdp-split-'));
+  const file = join(dir, 'port'); writeFileSync(file, '12346\n');
+  const fixture = hostFixture(dir);
+  const originals = { fetch: globalThis.fetch, WebSocket: globalThis.WebSocket, now: Date.now };
+  const owner = Date.now(), hash = buildRuntimeBundle(owner).hash;
+  const first = '11111111-1111-1111-1111-111111111111';
+  const second = '22222222-2222-2222-2222-222222222222';
+  const origin = 'https://127.0.0.1:5351';
+  let panes = [
+    { key: 'main-1', primary: true, focused: true, conversationId: first, loaded: false, modelConversationId: first, modelFamilies: ['Argon'] },
+    { key: 'main-2', primary: false, focused: false, conversationId: second, loaded: false, modelConversationId: second, modelFamilies: ['Claude'] },
+  ];
+  const inspectCalls = [];
+  const applyCalls = [];
+  const paneData = { [first]: { contextTokens: 111 }, [second]: { contextTokens: 222 } };
+  class FakeSocket {
+    constructor() { this.readyState = 0; queueMicrotask(() => { this.readyState = 1; this.onopen?.(); }); }
+    send(raw) {
+      const { id, method, params: { expression } } = JSON.parse(raw);
+      if (method !== 'Runtime.evaluate') {
+        const result = method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'frame' } } } : {};
+        if (method === 'Runtime.enable') {
+          this.onmessage({ data: JSON.stringify({
+            method: 'Runtime.executionContextCreated',
+            params: { context: { origin, uniqueId: 'doc-1', auxData: { isDefault: true, frameId: 'frame' } } },
+          }) });
+        }
+        this.onmessage({ data: JSON.stringify({ id, result }) });
+        return;
+      }
+      let value;
+      if (expression.includes('.readState(')) {
+        value = { owner, hash, path: '/c/' + first, hasFooter: true, conversationId: first, loadedMain: panes[0].loaded, panes };
+      } else if (expression.includes('.apply(')) {
+        applyCalls.push(expression);
+        for (const p of panes) if (expression.includes(JSON.stringify(p.key))) p.loaded = true;
+        value = true;
+      }
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ id, result: { result: { value } } }) }));
+    }
+    close() { if (this.readyState !== 3) { this.readyState = 3; queueMicrotask(() => this.onclose?.()); } }
+  }
+  globalThis.WebSocket = FakeSocket;
+  globalThis.fetch = async url => url.endsWith('/RetrieveUserQuotaSummary')
+    ? { ok: true }
+    : { ok: true, json: async () => [{ id: 'page', type: 'page', url: origin + '/c/' + first, webSocketDebuggerUrl: 'ws://127.0.0.1:12346/devtools/page/page' }] };
+  let injector;
+  try {
+    injector = startDeckInjector(async (convId, exact) => {
+      inspectCalls.push([convId, exact]);
+      return paneData[convId] || { contextTokens: 0 };
+    }, { ...fixture, portFile: file, instanceTs: owner });
+    await injector.tick();
+    assert.deepEqual(inspectCalls, [[first, true], [second, 'pane']], 'only the primary split pane updates the sidebar pointer');
+    assert.equal(applyCalls.length, 2);
+    assert.match(applyCalls[0], /"contextTokens":111.*"main-1"/);
+    assert.match(applyCalls[1], /"contextTokens":222.*"main-2"/);
+    assert.deepEqual(injector.models(first), ['Argon']);
+    assert.deepEqual(injector.models(second), ['Claude']);
+
+    // Unchanged panes are skipped; changing only the unfocused pane pushes only to that pane.
+    paneData[second] = { contextTokens: 333 };
+    await injector.tick();
+    assert.equal(applyCalls.length, 3);
+    assert.match(applyCalls[2], /"contextTokens":333.*"main-2"/);
+
+    // Switching focus updates exact mode without losing either pane.
+    panes = [
+      { ...panes[0], primary: false, focused: false },
+      { ...panes[1], primary: true, focused: true },
+    ];
+    inspectCalls.length = 0;
+    await injector.tick();
+    assert.deepEqual(inspectCalls, [[first, 'pane'], [second, true]]);
+  } finally {
+    await injector?.stop();
+    globalThis.fetch = originals.fetch; globalThis.WebSocket = originals.WebSocket; Date.now = originals.now;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

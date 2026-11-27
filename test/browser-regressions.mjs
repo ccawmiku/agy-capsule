@@ -29,37 +29,76 @@ const snapshot = () => ({
   quotaGroups: [{ displayName: 'Gemini Models', buckets: [{ window: '5h', remainingFraction: .58 }, { window: 'weekly', remainingFraction: .55 }] }],
 });
 
-await test('Footer probe and capsule follow the visible composer and release the old one', async t => {
+await test('Footer probe and capsules mount on all visible split composers and release hidden ones', async t => {
   const browser = await chromium.launch(launch);
   t.after(() => browser.close());
   const page = await browser.newPage({ viewport: { width: 1000, height: 600 } });
-  const panel = (id, style, attrs = '') => `<section ${attrs} style="${style}"><div id="${id}" data-testid="conversation-view"><div class="agy-composer-footer"><div><button>Gemini</button></div></div></div></section>`;
+  const first = '11111111-1111-1111-1111-111111111111';
+  const second = '22222222-2222-2222-2222-222222222222';
+  const panel = (id, style, attrs = '', convId = '') => `<section ${attrs} style="${style}"><div id="${id}" data-testid="conversation-view"${convId ? ` data-cascade-id="${convId}"` : ''}><div class="agy-composer-footer"><div><button>Gemini</button></div></div></div></section>`;
+  await page.route('http://agy.test/**', route => route.fulfill({ body: '', contentType: 'text/html' }));
+  await page.goto('http://agy.test/');
   await page.setContent([
     panel('hidden', 'display:none'), panel('invisible', 'visibility:hidden'), panel('transparent', 'opacity:0'),
     panel('offscreen', 'position:fixed;left:110vw;width:950px'), panel('flat', 'width:0'),
-    panel('small', 'width:320px', 'data-pane-id="small" data-pane-unfocused'),
-    panel('active', 'width:300px', 'data-pane-id="active"'),
+    '<div style="display:flex;gap:24px;margin-top:260px">' +
+      panel('small', 'width:320px', 'data-pane-id="small" data-pane-unfocused', second) +
+      panel('active', 'width:300px', 'data-pane-id="active"', first) +
+    '</div>',
   ].join(''));
   await page.evaluate(buildRuntimeBundle(owner).code);
-  const probe = () => page.evaluate(owner => globalThis.__agyCapsuleDeck.readState(owner).hasFooter, owner);
+  const state = () => page.evaluate(owner => globalThis.__agyCapsuleDeck.readState(owner), owner);
+  const probe = async () => (await state()).hasFooter;
   const host = page.locator('#agy-capsule-host');
+  const mainHosts = page.locator('[data-agy-capsule-main]');
   const mountedIn = () => host.evaluate(el => el.closest('[data-testid="conversation-view"]').id);
   const data = snapshot();
-  assert.equal(await probe(), true);
-  await apply(page, data);
+  const secondData = { ...data, contextTokens: 64000 };
+  const initialState = await state();
+  assert.equal(initialState.hasFooter, true);
+  assert.equal(initialState.panes.length, 2);
+  const smallPane = initialState.panes.find(p => p.conversationId === second);
+  const activePane = initialState.panes.find(p => p.conversationId === first);
+  assert.equal(activePane.primary, true);
+  assert.equal(smallPane.primary, false);
+  await page.evaluate(({ owner, first, second, data, secondData, activeKey, smallKey }) => {
+    globalThis.__agyCapsuleDeck.apply(data, location.pathname, owner, first, activeKey);
+    globalThis.__agyCapsuleDeck.apply(secondData, location.pathname, owner, second, smallKey);
+  }, { owner, first, second, data, secondData, activeKey: activePane.key, smallKey: smallPane.key });
+  assert.equal(await mainHosts.count(), 2, 'both split panes mount simultaneously');
   assert.equal(await mountedIn(), 'active');
+  assert.equal(await page.locator('#active [data-agy-capsule-main] [data-k="pillCtx"]').textContent(), '50%');
+  assert.equal(await page.locator('#small [data-agy-capsule-main] [data-k="pillCtx"]').textContent(), '25%');
+
+  // Pinning a popover on the second pane closes an already pinned popover on the first pane.
+  await page.locator('#active [data-agy-capsule-main] [data-el="grpCtx"] .dk-pill').click();
+  assert.equal(await page.locator('#active [data-agy-capsule-main] .dk-ctx-pop').isVisible(), true);
+  await page.locator('#small [data-agy-capsule-main] [data-el="grpCtx"] .dk-pill').click();
+  assert.equal(await page.locator('#active [data-agy-capsule-main] .dk-ctx-pop').isVisible(), false);
+  assert.equal(await page.locator('#small [data-agy-capsule-main] .dk-ctx-pop').isVisible(), true);
+
+  // Route changes from another pane must not clear an unchanged pane that has a DOM cascade ID.
+  await page.evaluate(first => history.replaceState({}, '', '/c/' + first), first);
+  await state();
+  assert.equal(await page.locator('#small [data-agy-capsule-main] .dk-ctx-pop').isVisible(), true);
+  assert.equal(await page.locator('#small [data-agy-capsule-main] [data-k="pillCtx"]').textContent(), '25%');
+  await page.evaluate(() => history.replaceState({}, '', '/'));
+  await state();
+  assert.equal(await mainHosts.count(), 2);
 
   await page.locator('section:has(#active)').evaluate(el => {
     el.querySelector('.agy-composer-footer > div').classList.add('dk-fl-squeezed');
     el.hidden = true;
   });
   await apply(page, data);
+  assert.equal(await mainHosts.count(), 1);
   assert.equal(await mountedIn(), 'small');
   assert.equal(await page.locator('#active .dk-fl-squeezed').count(), 0);
   await page.locator('#small').evaluate(el => { el.hidden = true; });
   assert.equal(await probe(), false);
   await apply(page, data);
   assert.equal(await host.count(), 0);
+  assert.equal(await mainHosts.count(), 0);
   await page.locator('section:has(#hidden)').evaluate(el => { el.style.display = 'block'; });
   assert.equal(await probe(), true);
   await apply(page, data);

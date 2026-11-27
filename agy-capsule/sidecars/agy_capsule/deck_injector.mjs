@@ -24,10 +24,11 @@ const PORT_FILE =
       ? join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'Antigravity', 'DevToolsActivePort')
       : join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'Antigravity', 'DevToolsActivePort');
 
-// Side panels reuse the native footer. Select the owning view, never the
-// widest composer; geometry only tells us whether a candidate is on screen.
-function findFooterLeft() {
-  let main = null, newComposer = null;
+// Side panels reuse the native footer. Select all visible owning main views
+// (including split panes), never the side-panel composers; geometry only tells
+// us whether a candidate is on screen.
+function findMainFooters() {
+  const items = [];
   const nonMain = '[data-side-panel-composer], [data-testid="side-question-tab-content"], [data-testid="subagent-tab-composer"], [data-testid="voice-dock-composer"]';
   for (const el of document.querySelectorAll('.agy-composer-footer > div:first-child')) {
     if (el.closest(nonMain)) continue;
@@ -39,15 +40,22 @@ function findFooterLeft() {
     const r = el.getBoundingClientRect();
     if (Math.min(r.bottom, innerHeight) <= Math.max(r.top, 0) ||
         Math.min(r.right, innerWidth) <= Math.max(r.left, 0)) continue;
-    if (view) {
-      const pane = view.closest('[data-pane-id]');
-      if (pane && !pane.hasAttribute('data-pane-unfocused')) return el;
-      main ??= el;
-    } else {
-      newComposer ??= el;
-    }
+    const pane = view?.closest('[data-pane-id]') || el.closest('[data-pane-id]') || null;
+    items.push({ footer: el, view: view || null, pane, hasView: Boolean(view), focused: !(pane && pane.hasAttribute('data-pane-unfocused')) });
   }
-  return main ?? newComposer;
+  if (!items.length) return [];
+  const hasExplicitFocus = items.some(item => item.pane && !item.pane.hasAttribute('data-pane-unfocused'));
+  let primaryIdx = hasExplicitFocus
+    ? items.findIndex(item => item.pane && !item.pane.hasAttribute('data-pane-unfocused'))
+    : items.findIndex(item => item.hasView);
+  if (primaryIdx < 0) primaryIdx = 0;
+  return items.map((item, idx) => ({ ...item, primary: idx === primaryIdx }));
+}
+
+function findFooterLeft(targetFooter = null) {
+  const entries = findMainFooters();
+  if (targetFooter) return entries.some(item => item.footer === targetFooter) ? targetFooter : null;
+  return (entries.find(item => item.primary) || entries[0])?.footer ?? null;
 }
 
 function conversationIdOf(el) {
@@ -80,7 +88,7 @@ export function readCompactionEstimate(footer, conversationId) {
 
 // The child transcript and the child composer share a wrapper. The composer
 // wrapper survives even when the host omits the input or native model button.
-function findSubagentAnchors(footer, includeSideChat = false) {
+function findSubagentAnchors(mainEntries, includeSideChat = false) {
   const anchors = new Map();
   const visible = el => {
     if (!el?.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return false;
@@ -88,38 +96,44 @@ function findSubagentAnchors(footer, includeSideChat = false) {
     return Math.min(r.right, innerWidth) > Math.max(r.left, 0) && Math.min(r.bottom, innerHeight) > Math.max(r.top, 0);
   };
   const add = (el, id) => { if (id && visible(el)) anchors.set(el, id); };
+  const mainList = Array.isArray(mainEntries)
+    ? mainEntries
+    : (mainEntries ? [{ footer: mainEntries, view: mainEntries.closest('[data-testid="conversation-view"]') }] : []);
+  const mainViews = new Set(mainList.map(item => item.view).filter(Boolean));
+  const mainIds = new Set(mainList.map(item => conversationIdOf(item.view)).filter(Boolean));
   // Side chat tabs host a full (non-subagent) conversation with the same
   // transcript + composer sibling layout as subagent tabs.
-  const mainId = conversationIdOf(footer?.closest('[data-testid="conversation-view"]'));
   const transcripts = '[data-testid="subagent-tab-conversation"][data-cascade-id]'
     + (includeSideChat ? ', [data-testid="side-question-tab-conversation"][data-cascade-id]' : '');
   for (const transcript of document.querySelectorAll(transcripts)) {
     const composer = transcript.nextElementSibling;
     const id = conversationIdOf(transcript);
     const sideChat = transcript.matches('[data-testid="side-question-tab-conversation"]');
-    if (id && !(sideChat && id === mainId) && composer?.matches('[data-testid="subagent-tab-composer"], [data-testid="side-question-tab-composer"]') && visible(transcript)) {
+    if (id && !(sideChat && mainIds.has(id)) && composer?.matches('[data-testid="subagent-tab-composer"], [data-testid="side-question-tab-composer"]') && visible(transcript)) {
       // The wrapper can have zero height before we add the strip.
       if (composer.checkVisibility({ opacityProperty: true, visibilityProperty: true })) anchors.set(composer, id);
     }
   }
   for (const el of document.querySelectorAll('[data-testid="conversation-view"][data-cascade-id]')) {
-    if (!el.contains(footer)) add(el, conversationIdOf(el));
+    if (!mainViews.has(el)) add(el, conversationIdOf(el));
   }
   return anchors;
 }
 
-function pageMount(d, childAnchor = null) {
+function pageMount(d, childAnchor = null, mainOptions = null) {
   if (window.__deckOwnerTs && d.instanceTs && d.instanceTs < window.__deckOwnerTs) {
     return 'superseded';
   }
   if (d.instanceTs) {
     window.__deckOwnerTs = d.instanceTs;
   }
-  const footerLeft = childAnchor || findFooterLeft();
+  const footerLeft = childAnchor || mainOptions?.footer || findFooterLeft();
   if (!footerLeft) {
-    window.__agyCapsuleCleanup?.();
+    if (!childAnchor && !mainOptions) window.__agyCapsuleCleanup?.();
     return 'no-footer';
   }
+  const isMain = !childAnchor;
+  const isPrimary = isMain && (mainOptions ? mainOptions.primary !== false : true);
   const childSidebar = childAnchor?.matches('[data-testid="subagent-tab-composer"], [data-testid="side-question-tab-composer"]');
   // Side chat: sit inside the native footer next to the model button, like the main composer.
   const sideAnchor = !!childAnchor?.matches('[data-testid="side-question-tab-composer"]');
@@ -135,7 +149,7 @@ function pageMount(d, childAnchor = null) {
   };
   const release = (node) => {
     if (!node) return;
-    document.removeEventListener('click', node._onOutsideClick);
+    document.removeEventListener('click', node._onOutsideClick, true);
     document.removeEventListener('keydown', node._onEscape);
     if (node._onResize) window.removeEventListener('resize', node._onResize);
     node._modelPicker?.dispose();
@@ -148,26 +162,37 @@ function pageMount(d, childAnchor = null) {
   // A late legacy injector may recreate its light-DOM strip after migration.
   // Remove it on every pass, not only when initializing the shadow host.
   const legacy = document.getElementById('deck-metrics-strip');
-  if (legacy && !childAnchor) { release(legacy); legacy.remove(); }
+  if (legacy && isMain) { release(legacy); legacy.remove(); }
   let host = childAnchor
     ? childAnchor.querySelector(sideAnchor ? '[data-agy-capsule-subagent]' : ':scope > [data-agy-capsule-subagent]')
-    : document.getElementById('agy-capsule-host');
+    : (mainOptions ? footerLeft.querySelector(':scope > [data-agy-capsule-main]') : (footerLeft.querySelector(':scope > [data-agy-capsule-main]') || document.getElementById('agy-capsule-host')));
   let root = host?.shadowRoot?.getElementById('deck-metrics-strip');
   if (!root) {
-    if (!childAnchor) window.__agyCapsuleCleanup?.();
+    if (isMain && !mainOptions) window.__agyCapsuleCleanup?.();
     host?.remove();
     host = document.createElement('div');
     if (childAnchor) {
       host.setAttribute('data-agy-capsule-subagent', '');
       host.style.cssText = 'display:block;align-self:center;width:100%;max-width:100%;box-sizing:border-box;flex:none;position:sticky;bottom:0;z-index:2';
     } else {
-      host.id = 'agy-capsule-host';
+      host.setAttribute('data-agy-capsule-main', '');
       host.style.display = 'contents';
     }
     const shadow = host.attachShadow({ mode: 'open' });
     root = document.createElement('div');
     root.id = 'deck-metrics-strip';
     shadow.appendChild(root);
+  }
+  if (isMain) {
+    if (!host.hasAttribute('data-agy-capsule-main')) host.setAttribute('data-agy-capsule-main', '');
+    if (isPrimary) {
+      for (const other of document.querySelectorAll('#agy-capsule-host')) {
+        if (other !== host) other.removeAttribute('id');
+      }
+      if (host.id !== 'agy-capsule-host') host.id = 'agy-capsule-host';
+    } else if (host.id === 'agy-capsule-host') {
+      host.removeAttribute('id');
+    }
   }
   // The capsule localizes this shadow tree itself, independently of the host.
   if (host.getAttribute('translate') !== 'no') host.setAttribute('translate', 'no');
@@ -935,12 +960,14 @@ function pageMount(d, childAnchor = null) {
     }
     root._dispose = () => {
       release(root);
-      nativeStyle?.remove();
       host.remove();
+      if (isMain && !document.querySelector('[data-agy-capsule-main]')) {
+        document.getElementById('agy-capsule-native-layout')?.remove();
+      }
       if (window.__agyCapsuleCleanup === root._dispose) delete window.__agyCapsuleCleanup;
     };
-    if (childAnchor) host._dispose = root._dispose;
-    else window.__agyCapsuleCleanup = root._dispose;
+    host._dispose = root._dispose;
+    if (!childAnchor && !mainOptions) window.__agyCapsuleCleanup = root._dispose;
 
     const groups = [...root.querySelectorAll('.dk-grp')];
     const overlays = groups.map(grp => grp.querySelector('.dk-pop')).filter(Boolean);
@@ -1046,7 +1073,7 @@ function pageMount(d, childAnchor = null) {
       }
       root._layoutPopovers();
     };
-    document.addEventListener('click', root._onOutsideClick);
+    document.addEventListener('click', root._onOutsideClick, true);
     document.addEventListener('keydown', root._onEscape);
     root._onResize = () => root._scheduleLayout?.();
     window.addEventListener('resize', root._onResize);
@@ -1746,68 +1773,120 @@ function installRuntime(owner, hash) {
   if (previous?.owner > owner) return 'superseded';
   previous?.dispose();
   window.__deckOwnerTs = owner;
-  let data = null;
-  let dataPath = '';
   // Pushed by the sidecar on every readState, so it applies even without a main footer.
   let sideChatEnabled = false;
-  let dataId = '';
-  let mainView = null;
-  let mainObserver;
+  let nextPaneId = 1;
+  const mainHosts = new Map();
   const quotas = createQuotaSnapshot();
   let nextQuotaRead = 0, readingQuota = false;
   let disposed = false;
   const children = new Map();
   const childHosts = new Map();
+  const removeMain = (footer, entry) => {
+    entry.observer?.disconnect();
+    footer.querySelector(':scope > [data-agy-capsule-main]')?._dispose?.();
+    mainHosts.delete(footer);
+  };
   const removeChild = (anchor, entry) => {
     entry.observer.disconnect();
     entry.host._dispose?.();
     childHosts.delete(anchor);
   };
+  const cleanupAllMain = () => {
+    for (const [footer, entry] of [...mainHosts]) removeMain(footer, entry);
+    for (const host of document.querySelectorAll('[data-agy-capsule-main], #agy-capsule-host')) host._dispose?.();
+  };
   const sync = (render = false) => {
-    const footer = findFooterLeft();
-    const view = footer?.closest('[data-testid="conversation-view"]') ?? null;
+    const detected = findMainFooters();
     const path = location.pathname;
-    const conversationId = conversationIdOf(view) || path.match(/\/c\/([0-9a-f-]{36})/i)?.[1] || '';
-    if (path !== dataPath) children.clear();
-    if (path !== dataPath || conversationId !== dataId) data = null;
-    dataPath = path;
-    dataId = conversationId;
-    if (view !== mainView) {
-      mainObserver?.disconnect();
-      if (view) {
-        mainObserver ??= new MutationObserver(() => sync());
-        mainObserver.observe(view, { attributes: true, attributeFilter: ['data-cascade-id'] });
-      }
-      mainView = view;
+    const pathId = path.match(/\/c\/([0-9a-f-]{36})/i)?.[1] || '';
+    const activeFooters = new Set(detected.map(item => item.footer));
+    for (const [footer, entry] of mainHosts) {
+      if (!activeFooters.has(footer) || !footer.isConnected) removeMain(footer, entry);
     }
+    let primaryEntry = null;
+    for (const item of detected) {
+      const domId = conversationIdOf(item.view);
+      const conversationId = domId || (item.primary && item.hasView ? pathId : '');
+      let entry = mainHosts.get(item.footer);
+      if (!entry) {
+        let observer = null;
+        if (item.view) {
+          observer = new MutationObserver(() => sync());
+          observer.observe(item.view, { attributes: true, attributeFilter: ['data-cascade-id'] });
+        }
+        entry = { key: 'main-' + (nextPaneId++), footer: item.footer, view: item.view, primary: item.primary, focused: item.focused, conversationId, dataPath: path, data: null, observer };
+        mainHosts.set(item.footer, entry);
+      } else {
+        if (entry.view !== item.view) {
+          entry.observer?.disconnect();
+          entry.observer = null;
+          if (item.view) {
+            entry.observer = new MutationObserver(() => sync());
+            entry.observer.observe(item.view, { attributes: true, attributeFilter: ['data-cascade-id'] });
+          }
+          entry.view = item.view;
+        }
+        if (entry.conversationId !== conversationId || (!domId && entry.dataPath !== path)) entry.data = null;
+        entry.primary = item.primary;
+        entry.focused = item.focused;
+        entry.conversationId = conversationId;
+        entry.dataPath = path;
+      }
+      if (item.primary) primaryEntry = entry;
+    }
+    const primaryHost = primaryEntry?.footer?.querySelector(':scope > [data-agy-capsule-main]') || null;
+    for (const other of document.querySelectorAll('#agy-capsule-host')) {
+      if (other !== primaryHost) other.removeAttribute('id');
+    }
+    if (primaryHost && primaryHost.id !== 'agy-capsule-host') primaryHost.id = 'agy-capsule-host';
     // Installed runtimes own the page; one-off legacy mounts must not strand
     // this runtime behind a newer timestamp while leaving two visible strips.
     window.__deckOwnerTs = owner;
-    const anchors = findSubagentAnchors(footer, sideChatEnabled);
+    window.__agyCapsuleCleanup = cleanupAllMain;
+    const anchors = findSubagentAnchors(detected, sideChatEnabled);
     const ids = new Set(anchors.values());
     for (const id of children.keys()) if (!ids.has(id)) children.delete(id);
     const snapshots = new Map(anchors);
-    const box = footer?.parentElement?.parentElement;
-    if (box && data?.subagent) snapshots.set(box, null);
+    const boxData = new Map();
+    for (const entry of mainHosts.values()) {
+      const box = entry.footer.parentElement?.parentElement;
+      if (box && entry.data?.subagent) {
+        snapshots.set(box, null);
+        boxData.set(box, entry.data);
+      }
+    }
     for (const [anchor, entry] of childHosts) {
       if (!snapshots.has(anchor) || snapshots.get(anchor) !== entry.id || !entry.host.isConnected) {
         removeChild(anchor, entry);
       }
     }
-    if (!footer || !data || data.subagent) window.__agyCapsuleCleanup?.();
-    else if (render) {
-      if (data.useComposerQuota && !readingQuota && Date.now() >= nextQuotaRead) {
+    if (render) {
+      const candidates = [...mainHosts.values()].filter(entry => entry.data?.useComposerQuota && !entry.data.subagent);
+      const quotaEntry = candidates.find(entry => entry.primary && entry.footer.querySelector('button[data-testid="model-selector-trigger"]'))
+        || candidates.find(entry => entry.footer.querySelector('button[data-testid="model-selector-trigger"]'))
+        || candidates.find(entry => entry.primary)
+        || candidates[0];
+      if (quotaEntry && !readingQuota && Date.now() >= nextQuotaRead) {
         readingQuota = true;
-        const billingMode = readBillingMode?.(footer) || 'unknown';
-        readComposerQuota(footer).then(groups => quotas.observe(groups && { groups, at: Date.now(), billingMode }), () => quotas.observe(null))
+        const billingMode = readBillingMode?.(quotaEntry.footer) || 'unknown';
+        readComposerQuota(quotaEntry.footer).then(groups => quotas.observe(groups && { groups, at: Date.now(), billingMode }), () => quotas.observe(null))
           .finally(() => { readingQuota = false; nextQuotaRead = Date.now() + 15_000; });
       }
-      const sample = data.useComposerQuota && quotas.read();
-      pageMount(toView(data.useComposerQuota ? { ...data, quotaGroups: sample?.groups ?? [],
-        quotaStaleAt: sample?.stale ? sample.at : null, hideQuota: !sample?.groups.length } : data));
+    }
+    for (const entry of mainHosts.values()) {
+      if (!entry.data || entry.data.subagent) {
+        entry.footer.querySelector(':scope > [data-agy-capsule-main]')?._dispose?.();
+      } else if (render) {
+        const sample = entry.data.useComposerQuota && quotas.read();
+        pageMount(toView(entry.data.useComposerQuota ? { ...entry.data, quotaGroups: sample?.groups ?? [],
+          quotaStaleAt: sample?.stale ? sample.at : null, hideQuota: !sample?.groups.length } : entry.data),
+          null, { footer: entry.footer, primary: entry.primary });
+        window.__agyCapsuleCleanup = cleanupAllMain;
+      }
     }
     if (render) for (const [anchor, id] of snapshots) {
-      const next = id === null ? data : children.get(id);
+      const next = id === null ? boxData.get(anchor) : children.get(id);
       const entry = childHosts.get(anchor);
       if (!next?.subagent) {
         if (entry) removeChild(anchor, entry);
@@ -1826,7 +1905,24 @@ function installRuntime(owner, hash) {
       }
     }
     const sideIds = [...anchors].filter(([el]) => el.matches('[data-testid="side-question-tab-composer"]')).map(([, id]) => id);
-    return { footer, conversationId, ids, sideIds, hasKnownChildAnchor: [...anchors.keys()].some(el => el.matches('[data-testid="subagent-tab-composer"], [data-testid="side-question-tab-composer"]')) };
+    return { primaryEntry, panes: [...mainHosts.values()], ids, sideIds, hasKnownChildAnchor: [...anchors.keys()].some(el => el.matches('[data-testid="subagent-tab-composer"], [data-testid="side-question-tab-composer"]')) };
+  };
+  const readPaneMeta = entry => {
+    let modelConversationId = null, modelFamilies = null, contextEstimate = null;
+    try {
+      const trigger = entry.footer.querySelector('button[data-testid="model-selector-trigger"]');
+      const pickerState = trigger && readPickerState(trigger);
+      if (pickerState?.families?.length) {
+        modelConversationId = pickerState.conversationId;
+        modelFamilies = pickerState.families;
+      }
+    } catch {}
+    try {
+      if (entry.view && conversationIdOf(entry.view) === entry.conversationId && entry.conversationId) {
+        contextEstimate = readCompactionEstimate(entry.footer, entry.conversationId);
+      }
+    } catch {}
+    return { modelConversationId, modelFamilies, contextEstimate };
   };
   const timer = setInterval(() => sync(true), 1000);
   const api = {
@@ -1834,28 +1930,30 @@ function installRuntime(owner, hash) {
     readState(caller, opts) {
       if (caller < owner) return 'superseded';
       if (typeof opts?.sideChat === 'boolean') sideChatEnabled = opts.sideChat;
-      const { footer, conversationId, ids, sideIds, hasKnownChildAnchor } = sync();
-      let modelConversationId = null, modelFamilies = null, contextEstimate = null;
-      if (footer) {
-        try {
-          const trigger = footer.querySelector('button[data-testid="model-selector-trigger"]');
-          const pickerState = trigger && readPickerState(trigger);
-          if (pickerState?.families?.length) {
-            modelConversationId = pickerState.conversationId;
-            modelFamilies = pickerState.families;
-          }
-        } catch {}
-        try {
-          if (conversationIdOf(mainView) === conversationId && conversationId) {
-            contextEstimate = readCompactionEstimate(footer, conversationId);
-          }
-        } catch {}
-      }
+      const { primaryEntry, panes, ids, sideIds, hasKnownChildAnchor } = sync();
+      const paneStates = panes.map(entry => ({
+        key: entry.key,
+        primary: entry.primary,
+        focused: entry.focused,
+        conversationId: entry.conversationId,
+        loaded: !!entry.data,
+        ...readPaneMeta(entry),
+      }));
+      const primaryMeta = primaryEntry
+        ? (paneStates.find(item => item.key === primaryEntry.key) || { modelConversationId: null, modelFamilies: null, contextEstimate: null })
+        : { modelConversationId: null, modelFamilies: null, contextEstimate: null };
       let effortSync = null;
       try { effortSync = effortEffects().readPendingPatch(); } catch {}
-      return { owner, hash, path: location.pathname, hasFooter: !!footer, modelConversationId, modelFamilies, effortSync, contextEstimate,
+      return { owner, hash, path: location.pathname, hasFooter: !!primaryEntry,
+        modelConversationId: primaryMeta.modelConversationId,
+        modelFamilies: primaryMeta.modelFamilies,
+        effortSync,
+        contextEstimate: primaryMeta.contextEstimate,
         ...(opts?.includeQuota && { quotaSnapshot: quotas.read() }),
-        conversationId, loadedMain: !!data, hasKnownChildAnchor, subagentIds: [...ids], sideIds, loadedSubagentIds: [...children.keys()] };
+        conversationId: primaryEntry?.conversationId || '',
+        loadedMain: !!primaryEntry?.data,
+        panes: paneStates,
+        hasKnownChildAnchor, subagentIds: [...ids], sideIds, loadedSubagentIds: [...children.keys()] };
     },
     ackEffortSync(caller, rev) {
       if (caller < owner) return 'superseded';
@@ -1866,17 +1964,24 @@ function installRuntime(owner, hash) {
     readCloudTelemetry(caller, path, convId) {
       if (caller < owner) return 'superseded';
       if (caller !== owner || disposed || path !== location.pathname || !convId) return false;
-      const { footer, conversationId } = sync();
-      if (!footer || conversationId !== convId) return false;
-      if (conversationIdOf(footer.closest('[data-testid="conversation-view"]')) !== convId) return null;
+      const { panes } = sync();
+      const matching = panes.filter(entry => entry.conversationId === convId);
+      if (!matching.length) return false;
+      if (!matching.some(entry => entry.view && conversationIdOf(entry.view) === convId)) return null;
       try { return readCloudTrajectory(convId); } catch { return null; }
     },
-    apply(next, path, caller, id) {
+    apply(next, path, caller, id, paneKey) {
       if (caller < owner) return 'superseded';
       if (caller !== owner || disposed || path !== location.pathname) return false;
       const current = sync();
-      if (id !== undefined && (!current.footer || current.conversationId !== id)) return false;
-      data = next;
+      const target = paneKey !== undefined
+        ? current.panes.find(entry => entry.key === paneKey)
+        : (id !== undefined
+            ? (current.primaryEntry?.conversationId === id ? current.primaryEntry : current.panes.find(entry => entry.conversationId === id))
+            : current.primaryEntry);
+      if (!target) return false;
+      if (id !== undefined && target.conversationId !== id) return false;
+      target.data = next;
       sync(true);
       return true;
     },
@@ -1892,10 +1997,11 @@ function installRuntime(owner, hash) {
       if (disposed) return;
       disposed = true;
       clearInterval(timer);
-      mainObserver?.disconnect();
-      for (const [anchor, entry] of childHosts) removeChild(anchor, entry);
+      for (const [footer, entry] of [...mainHosts]) removeMain(footer, entry);
+      for (const [anchor, entry] of [...childHosts]) removeChild(anchor, entry);
       if (globalThis.__agyCapsuleDeck === api) {
-        window.__agyCapsuleCleanup?.();
+        cleanupAllMain();
+        if (window.__agyCapsuleCleanup === cleanupAllMain) delete window.__agyCapsuleCleanup;
         delete globalThis.__agyCapsuleDeck;
       }
     },
@@ -1905,7 +2011,7 @@ function installRuntime(owner, hash) {
 }
 
 export function buildRuntimeBundle(owner = INSTANCE_TS, readBilling) {
-  const functions = [toView, findFooterLeft, conversationIdOf, readCompactionEstimate, findSubagentAnchors, resolveInheritedLabel, readPickerState, readAgentState, renderAgentEntry, createMotionThemes, motionThemes, createUpstreamEffort, effortEffects, mountEffortBar, mountOrchestratorSwitch, syncModelPicker, readCloudTrajectory, createQuotaSnapshot, readComposerQuota, pageMount, installRuntime].map(fn => fn.toString()).join('\n');
+  const functions = [toView, findMainFooters, findFooterLeft, conversationIdOf, readCompactionEstimate, findSubagentAnchors, resolveInheritedLabel, readPickerState, readAgentState, renderAgentEntry, createMotionThemes, motionThemes, createUpstreamEffort, effortEffects, mountEffortBar, mountOrchestratorSwitch, syncModelPicker, readCloudTrajectory, createQuotaSnapshot, readComposerQuota, pageMount, installRuntime].map(fn => fn.toString()).join('\n');
   const effortBar = `const EFFORT_BAR_CSS=${JSON.stringify(EFFORT_BAR_CSS)};const AGENT_ENTRY_CSS=${JSON.stringify(AGENT_ENTRY_CSS)};`;
   const source = getPresentationScript() + '\n' + effortBar + '\nconst readBillingMode=' + (readBilling?.toString() || 'null') + ';\n' + functions;
   const hash = createHash('sha256').update(source).digest('hex').slice(0, 16);
@@ -1999,6 +2105,7 @@ export function startDeckInjector(inspect, options = {}) {
           if (ctx.auxData?.isDefault && ctx.auxData.frameId === entry.frameId) {
             entry.context = ctx.origin === entry.origin ? ctx.uniqueId : null;
             entry.lastPayload = '';
+            entry.lastPanePayloads?.clear();
           }
         } else if (message.method === 'Runtime.executionContextsCleared' ||
                    (message.method === 'Runtime.executionContextDestroyed' && message.params.executionContextUniqueId === entry.context)) {
@@ -2095,6 +2202,7 @@ export function startDeckInjector(inspect, options = {}) {
             if (installed === 'superseded') return await supersede();
             if (!installed || stopped) { failed++; continue; }
             entry.lastPayload = '';
+            entry.lastPanePayloads = new Map();
             entry.lastChildPayloads = new Map();
             state = await run(`globalThis.__agyCapsuleDeck?.readState(${owner},${readOpts})??null`);
           }
@@ -2111,35 +2219,55 @@ export function startDeckInjector(inspect, options = {}) {
             if (stopped) break;
           }
           const childIds = Array.isArray(state.subagentIds) ? state.subagentIds.filter(id => typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id)) : [];
-          if (state.hasFooter !== true && !childIds.length) { noAnchor++; continue; }
-          const mainId = state.conversationId || state.path.match(/\/c\/([0-9a-f-]{36})/i)?.[1] || '';
-          if (mainId && state.modelConversationId === mainId && Array.isArray(state.modelFamilies) && state.modelFamilies.length > 0) {
-            nextModels.set(mainId, state.modelFamilies);
-          }
+          const panes = Array.isArray(state.panes)
+            ? state.panes
+            : (state.hasFooter === true
+                ? [{ key: null, primary: true, focused: true,
+                    conversationId: state.conversationId || state.path.match(/\/c\/([0-9a-f-]{36})/i)?.[1] || '',
+                    loaded: state.loadedMain, modelConversationId: state.modelConversationId,
+                    modelFamilies: state.modelFamilies, contextEstimate: state.contextEstimate }]
+                : []);
+          if (!panes.length && !childIds.length) { noAnchor++; continue; }
+          const panePayloads = entry.lastPanePayloads ??= new Map();
+          const paneKeys = new Set(panes.map(pane => pane.key ?? '__single__'));
+          for (const key of panePayloads.keys()) if (!paneKeys.has(key)) panePayloads.delete(key);
           // Data-source failures belong to the sidebar health path, not to CDP.
-          let pageFailed = false;
-          if (state.hasFooter === true) {
-            if (mainId && options.needsCloudTelemetry?.(mainId)) {
+          let pageFailed = false, contextInvalidated = false;
+          const cloudRead = new Set();
+          for (const pane of panes) {
+            const mainId = pane.conversationId || '';
+            if (mainId && pane.modelConversationId === mainId && Array.isArray(pane.modelFamilies) && pane.modelFamilies.length > 0) {
+              nextModels.set(mainId, pane.modelFamilies);
+            }
+            if (mainId && !cloudRead.has(mainId) && options.needsCloudTelemetry?.(mainId)) {
+              cloudRead.add(mainId);
               const cloud = await run(`globalThis.__agyCapsuleDeck?.readCloudTelemetry(${owner},${JSON.stringify(state.path)},${JSON.stringify(mainId)})`);
               if (cloud === 'superseded') return await supersede();
               if (stopped) break;
-              if (entry.closed || context !== entry.context || cloud === false) continue;
+              if (entry.closed || context !== entry.context || cloud === false) { contextInvalidated = true; break; }
               if (cloud === null || cloud?.conversationId === mainId) options.onCloudTelemetry?.(mainId, cloud);
             }
-            const estimate = mainId ? state.contextEstimate ?? null : null;
+            const estimate = mainId ? pane.contextEstimate ?? null : null;
             if (estimate) nextEstimates.set(mainId, estimate);
+            const exactMode = pane.primary !== false ? true : 'pane';
             const data = await Promise.resolve().then(() => estimate
-              ? inspect(mainId, true, false, estimate) : inspect(mainId, true)).catch(() => null);
+              ? inspect(mainId, exactMode, false, estimate) : inspect(mainId, exactMode)).catch(() => null);
             if (data && !data.error && !stopped) {
               const payload = JSON.stringify(data);
-              if (entry.lastPayload !== payload || entry.lastPath !== state.path || entry.lastConversationId !== mainId || state.loadedMain === false) {
-                const applied = await run(`globalThis.__agyCapsuleDeck?.apply(${payload},${JSON.stringify(state.path)},${owner},${JSON.stringify(mainId)})??false`);
+              const cacheKey = pane.key ?? '__single__';
+              const prev = panePayloads.get(cacheKey);
+              if (!prev || prev.payload !== payload || prev.path !== state.path || prev.conversationId !== mainId || pane.loaded === false) {
+                const applyArgs = pane.key === null
+                  ? `${payload},${JSON.stringify(state.path)},${owner},${JSON.stringify(mainId)}`
+                  : `${payload},${JSON.stringify(state.path)},${owner},${JSON.stringify(mainId)},${JSON.stringify(pane.key)}`;
+                const applied = await run(`globalThis.__agyCapsuleDeck?.apply(${applyArgs})??false`);
                 if (applied === 'superseded') return await supersede();
-                if (applied) { entry.lastPayload = payload; entry.lastPath = state.path; entry.lastConversationId = mainId; }
-                else { entry.lastPayload = ''; pageFailed = true; }
+                if (applied) panePayloads.set(cacheKey, { payload, path: state.path, conversationId: mainId });
+                else { panePayloads.delete(cacheKey); pageFailed = true; }
               }
             }
           }
+          if (contextInvalidated) continue;
           const childPayloads = entry.lastChildPayloads ??= new Map();
           const loaded = new Set(state.loadedSubagentIds);
           let hasChild = state.hasKnownChildAnchor === true;
@@ -2158,7 +2286,7 @@ export function startDeckInjector(inspect, options = {}) {
             // A child tab can close while its DB is being read. Its stale
             // response is rejected without counting as an injector failure.
           }
-          if (state.hasFooter !== true && !hasChild) noAnchor++;
+          if (!panes.length && !hasChild) noAnchor++;
           if (pageFailed) failed++;
           lastErr = '';
         } catch (error) {

@@ -172,10 +172,10 @@ function getActiveConversationIds() {
 }
 
 async function inspectConversation(convId, exact = false, subagentOnly = false, estimate = null) {
-  if (exact && !subagentOnly) lastDeckConvId = convId || '';
+  if (exact === true && !subagentOnly) lastDeckConvId = convId || '';
   if (subagentOnly && !convId) return null;
-  return readSelectedConversation(subagentOnly ? convId : lastDeckConvId ?? convId,
-    !subagentOnly && lastDeckConvId === null, subagentOnly, estimate);
+  const targetId = subagentOnly ? convId : (exact === 'pane' ? (convId || '') : (lastDeckConvId ?? convId));
+  return readSelectedConversation(targetId, !subagentOnly && exact !== 'pane' && lastDeckConvId === null, subagentOnly, estimate);
 }
 
 async function readSelectedConversation(convId, allowLatest, subagentOnly = false, estimate = null) {

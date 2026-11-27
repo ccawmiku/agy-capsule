@@ -570,7 +570,7 @@ export function syncModelPicker(root, footer, prefsOrEnabled, labels, findFooter
     hideSub();
     if (panel.matches(':popover-open')) panel.hidePopover();
   };
-  const isCurrent = () => findFooterLeft() === footer && trigger.isConnected &&
+  const isCurrent = () => findFooterLeft(footer) === footer && trigger.isConnected &&
     footer.querySelector('button[data-testid="model-selector-trigger"]') === trigger;
 
   const tintEffort = (node, group, label) => {

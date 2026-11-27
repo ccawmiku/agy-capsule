@@ -106,6 +106,9 @@ test('child reads never move the main sidebar and alerts stay in the child execu
   assert.equal((await inspectConversation('child', true, 'side')).contextTokens, 150);
   assert.equal(await inspectConversation('missing', true, 'side'), null);
   assert.equal((await inspectConversation()).contextTokens, 77, 'side reads do not move the CDP composer pointer');
+  assert.equal((await inspectConversation('child', 'pane')).contextTokens, 150, 'unfocused split panes read their own conversation');
+  assert.equal((await inspectConversation('', 'pane')).contextTokens, 0, 'unfocused new-conversation panes return empty context');
+  assert.equal((await inspectConversation()).contextTokens, 77, 'unfocused split-pane reads do not move the CDP composer pointer');
 
   let postContext;
   class SidecarApp {
